@@ -1741,6 +1741,17 @@ fn ssh_config_quote(path: &str) -> String {
     format!("\"{path}\"")
 }
 
+/// Formats a local path for an ssh_config `Include`. OpenSSH accepts forward
+/// slashes on Windows, while backslashes are parsed as escapes.
+fn ssh_config_include_path(path: &Path) -> String {
+    let path = path.to_string_lossy();
+    if std::path::MAIN_SEPARATOR == '\\' {
+        ssh_config_quote(&path.replace('\\', "/"))
+    } else {
+        ssh_config_quote(&path)
+    }
+}
+
 /// Builds a temporary ssh config for remote attach commands without overriding
 /// the user's own settings, returning its path.
 ///
@@ -1761,14 +1772,14 @@ fn write_managed_ssh_config() -> io::Result<ManagedSshConfig> {
         if user_config.is_file() {
             contents.push_str(&format!(
                 "Include {}\n",
-                ssh_config_quote(&user_config.to_string_lossy())
+                ssh_config_include_path(&user_config)
             ));
         }
     }
     if let Some(system_config) = paths.system_config.filter(|path| path.is_file()) {
         contents.push_str(&format!(
             "Include {}\n",
-            ssh_config_quote(&system_config.to_string_lossy())
+            ssh_config_include_path(&system_config)
         ));
     }
     contents.push_str("Host *\n");
@@ -2157,10 +2168,7 @@ mod tests {
         if let Some(home) = std::env::var_os("HOME") {
             let user_config = PathBuf::from(home).join(".ssh").join("config");
             if user_config.is_file() {
-                let include = format!(
-                    "Include {}",
-                    ssh_config_quote(&user_config.to_string_lossy())
-                );
+                let include = format!("Include {}", ssh_config_include_path(&user_config));
                 let include_at = contents.find(&include).expect("user config Included");
                 let fallback_at = contents.find("Host *").expect("fallback present");
                 assert!(
@@ -2188,10 +2196,19 @@ mod tests {
     }
 
     #[test]
-    fn ssh_config_quote_wraps_path_with_spaces() {
+    fn ssh_config_include_path_wraps_path_with_spaces() {
         assert_eq!(
-            ssh_config_quote("/home/a b/.ssh/config"),
+            ssh_config_include_path(Path::new("/home/a b/.ssh/config")),
             "\"/home/a b/.ssh/config\""
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ssh_config_include_path_uses_forward_slashes() {
+        assert_eq!(
+            ssh_config_include_path(Path::new(r"C:\Users\A B\.ssh\config")),
+            "\"C:/Users/A B/.ssh/config\""
         );
     }
 
@@ -2266,10 +2283,7 @@ mod tests {
             .map(|home| home.join(".ssh").join("config"))
             .filter(|path| path.is_file())
         {
-            let include = format!(
-                "Include {}",
-                ssh_config_quote(&user_config.to_string_lossy())
-            );
+            let include = format!("Include {}", ssh_config_include_path(&user_config));
             assert!(contents.contains(&include), "missing {include}: {contents}");
         }
 
