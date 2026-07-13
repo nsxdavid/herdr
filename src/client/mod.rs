@@ -659,7 +659,6 @@ fn requested_render_encoding() -> RenderEncoding {
     }
 }
 
-#[cfg(unix)]
 fn is_remote_client_process() -> bool {
     std::env::var(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR).is_ok()
 }
@@ -672,11 +671,9 @@ fn is_remote_client_process() -> bool {
 /// window; on a high-latency link that easily exceeds 5s, so it gets a far
 /// larger budget. See issue #753.
 const LOCAL_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(5);
-#[cfg(unix)]
 const REMOTE_HANDSHAKE_READ_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn handshake_read_timeout() -> Duration {
-    #[cfg(unix)]
     if is_remote_client_process() {
         return REMOTE_HANDSHAKE_READ_TIMEOUT;
     }
@@ -2166,6 +2163,14 @@ mod tests {
         fn drop(&mut self) {
             restore_env_var(self.key, self.previous.clone());
         }
+    }
+
+    #[test]
+    fn windows_remote_client_uses_extended_handshake_timeout() {
+        let _guard = env_lock().lock().unwrap();
+        let _remote = EnvVarGuard::set(crate::remote::REMOTE_KEYBINDINGS_ENV_VAR, "local");
+
+        assert_eq!(handshake_read_timeout(), REMOTE_HANDSHAKE_READ_TIMEOUT);
     }
 
     #[test]

@@ -1972,7 +1972,6 @@ fn copy_reader_to_local_stream<R: io::Read>(
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(count) => {
                     written += count;
-                    max_chunk_len = max_chunk_len.min(count);
                     write_chunk_succeeded = true;
                 }
                 Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
