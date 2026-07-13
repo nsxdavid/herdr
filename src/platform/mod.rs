@@ -43,9 +43,16 @@ pub(crate) struct PlatformCapabilities {
 pub(crate) const fn capabilities() -> PlatformCapabilities {
     PlatformCapabilities {
         live_handoff: cfg!(unix),
-        remote_attach: cfg!(unix),
+        remote_attach: cfg!(any(unix, windows)),
         direct_terminal_attach: cfg!(unix),
     }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct RemoteSshConfigPaths {
+    pub(crate) user_config: Option<std::path::PathBuf>,
+    pub(crate) system_config: Option<std::path::PathBuf>,
+    pub(crate) multiplexing: bool,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -132,6 +139,9 @@ pub(crate) fn read_limited_reader(
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::*;
+
+#[cfg(unix)]
+mod unix_common;
 
 #[cfg(target_os = "macos")]
 mod macos;

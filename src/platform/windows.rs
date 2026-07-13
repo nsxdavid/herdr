@@ -40,6 +40,59 @@ use super::{ClipboardImage, ForegroundJob, Signal};
 
 const STILL_ACTIVE: u32 = 259;
 
+pub(crate) fn remote_ssh_config_paths() -> super::RemoteSshConfigPaths {
+    super::RemoteSshConfigPaths {
+        user_config: std::env::var_os("USERPROFILE")
+            .map(PathBuf::from)
+            .map(|home| home.join(".ssh").join("config")),
+        system_config: std::env::var_os("PROGRAMDATA")
+            .map(PathBuf::from)
+            .map(|dir| dir.join("ssh").join("ssh_config")),
+        multiplexing: false,
+    }
+}
+
+pub(crate) fn create_remote_ssh_config_dir(_control_socket_name: &str) -> std::io::Result<PathBuf> {
+    let base = remote_private_temp_base();
+    std::fs::create_dir_all(&base)?;
+    for attempt in 0..100 {
+        let dir = base.join(format!("ssh-{}-{attempt}", std::process::id()));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "failed to create private herdr ssh config directory",
+    ))
+}
+
+pub(crate) fn create_remote_ssh_config_file(
+    path: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+}
+
+pub(crate) fn remote_private_temp_base() -> PathBuf {
+    crate::config::state_dir().join("remote")
+}
+
+pub(crate) fn remote_bridge_endpoint_path(_readable_name: &str, short_name: &str) -> PathBuf {
+    remote_private_temp_base().join(short_name)
+}
+
+pub(crate) fn remote_reattach_program(_program: &str) -> String {
+    // The installed launcher is on PATH and works in both PowerShell and cmd.
+    // An absolute executable path with spaces would require shell-specific
+    // quoting (and PowerShell's call operator), making the hint less portable.
+    "herdr".to_string()
+}
+
 pub(crate) fn should_draw_host_cursor_by_default() -> bool {
     true
 }
