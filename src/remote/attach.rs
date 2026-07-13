@@ -1904,11 +1904,11 @@ fn bridge_connection(
         .join()
         .map_err(|_| io::Error::other("remote bridge download worker panicked"))?;
 
-    upload_result
-        .map_err(|err| io::Error::new(err.kind(), format!("remote bridge upload failed: {err}")))?;
-    download_result.map_err(|err| {
-        io::Error::new(err.kind(), format!("remote bridge download failed: {err}"))
-    })?;
+    let bridge_stopping = bridge_stop.load(Ordering::Acquire);
+    let client_closed = client_closed.load(Ordering::Acquire);
+    let teardown_expected = bridge_stopping || client_closed;
+    finish_bridge_worker(upload_result, "upload", teardown_expected)?;
+    finish_bridge_worker(download_result, "download", teardown_expected)?;
 
     if let Some(err) = supervisor_error {
         return Err(io::Error::new(
@@ -1917,11 +1917,7 @@ fn bridge_connection(
         ));
     }
 
-    if bridge_exit_is_expected(
-        status.success(),
-        bridge_stop.load(Ordering::Acquire),
-        client_closed.load(Ordering::Acquire),
-    ) {
+    if bridge_exit_is_expected(status.success(), bridge_stopping, client_closed) {
         Ok(())
     } else {
         Err(io::Error::new(
@@ -1929,6 +1925,23 @@ fn bridge_connection(
             format!("ssh bridge exited with {status}"),
         ))
     }
+}
+
+fn finish_bridge_worker(
+    result: io::Result<u64>,
+    direction: &'static str,
+    teardown_expected: bool,
+) -> io::Result<()> {
+    if teardown_expected {
+        return Ok(());
+    }
+
+    result.map(|_| ()).map_err(|err| {
+        io::Error::new(
+            err.kind(),
+            format!("remote bridge {direction} failed: {err}"),
+        )
+    })
 }
 
 fn bridge_exit_is_expected(
@@ -2379,6 +2392,29 @@ mod tests {
         assert!(bridge_exit_is_expected(false, true, false));
         assert!(bridge_exit_is_expected(false, false, true));
         assert!(!bridge_exit_is_expected(false, false, false));
+    }
+
+    #[test]
+    fn windows_bridge_expected_teardown_ignores_worker_pipe_errors() {
+        let result = finish_bridge_worker(Err(io::ErrorKind::BrokenPipe.into()), "download", true);
+
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn windows_bridge_unexpected_teardown_preserves_worker_errors() {
+        let err = finish_bridge_worker(
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "client closed")),
+            "download",
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            err.to_string(),
+            "remote bridge download failed: client closed"
+        );
     }
 
     #[test]
