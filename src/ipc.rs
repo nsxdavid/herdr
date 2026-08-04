@@ -16,6 +16,12 @@ pub(crate) enum LocalStreamRead {
     Closed,
 }
 
+pub(crate) enum LocalStreamReadCount {
+    Data(usize),
+    Pending,
+    Closed,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct SocketFileIdentity {
     #[cfg(unix)]
@@ -125,16 +131,94 @@ pub(crate) fn set_local_stream_polling(stream: &mut LocalStream, enabled: bool) 
     }
 }
 
+/// Sets nonblocking mode for both reads and writes.
+///
+/// Most Windows callers use `PeekNamedPipe` and leave the stream blocking, but
+/// full-duplex bridges need writes to remain cancellable under backpressure.
+pub(crate) fn set_local_stream_nonblocking(
+    stream: &mut LocalStream,
+    enabled: bool,
+) -> io::Result<()> {
+    use interprocess::local_socket::traits::Stream as _;
+
+    stream.set_nonblocking(enabled)
+}
+
+/// Whether a successful zero-byte write means the nonblocking transport is
+/// temporarily full rather than closed.
+pub(crate) fn local_stream_zero_write_is_pending() -> bool {
+    cfg!(windows)
+}
+
+/// Caps a nonblocking write to a size Windows named pipes can accept without
+/// requiring the entire larger caller buffer to fit at once.
+pub(crate) fn local_stream_write_chunk_len(remaining: usize) -> usize {
+    if cfg!(windows) {
+        remaining.min(4 * 1024)
+    } else {
+        remaining
+    }
+}
+
 pub(crate) fn poll_local_stream_read(
     stream: &mut LocalStream,
     buf: &mut [u8],
 ) -> io::Result<LocalStreamRead> {
+    match poll_local_stream_read_count(stream, buf)? {
+        LocalStreamReadCount::Data(_) => Ok(LocalStreamRead::Data),
+        LocalStreamReadCount::Pending => Ok(LocalStreamRead::Pending),
+        LocalStreamReadCount::Closed => Ok(LocalStreamRead::Closed),
+    }
+}
+
+/// Binds a local listener carrying private terminal traffic.
+///
+/// Unix permissions are restricted after bind. On Windows the access check is
+/// part of named-pipe creation, so the listener must receive a protected DACL
+/// up front rather than relying on the permissive default descriptor.
+pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<LocalListener> {
+    #[cfg(unix)]
+    {
+        bind_local_listener(path)
+    }
+
+    #[cfg(windows)]
+    {
+        use interprocess::local_socket::{prelude::*, GenericNamespaced, ListenerOptions};
+        use interprocess::os::windows::local_socket::ListenerOptionsExt as _;
+        use interprocess::os::windows::security_descriptor::SecurityDescriptor;
+        use widestring::U16CString;
+
+        // Protected DACL: full access for the object owner and Local System.
+        // The owner ACE keeps the launching user able to connect while the
+        // protected flag prevents permissive inherited/default pipe entries.
+        let sddl = U16CString::from_str("D:P(A;;GA;;;SY)(A;;GA;;;OW)")
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+        let security_descriptor = SecurityDescriptor::deserialize(&sddl)?;
+        let name = path.to_string_lossy().to_string();
+        let name = name.to_ns_name::<GenericNamespaced>()?;
+        let listener = ListenerOptions::new()
+            .name(name)
+            .reclaim_name(false)
+            .security_descriptor(security_descriptor)
+            .create_sync()?;
+        fs::write(path, windows_socket_marker())?;
+        Ok(listener)
+    }
+}
+
+pub(crate) fn poll_local_stream_read_count(
+    stream: &mut LocalStream,
+    buf: &mut [u8],
+) -> io::Result<LocalStreamReadCount> {
     #[cfg(unix)]
     {
         match stream.read(buf) {
-            Ok(0) => Ok(LocalStreamRead::Closed),
-            Ok(_) => Ok(LocalStreamRead::Data),
-            Err(err) if err.kind() == io::ErrorKind::WouldBlock => Ok(LocalStreamRead::Pending),
+            Ok(0) => Ok(LocalStreamReadCount::Closed),
+            Ok(read) => Ok(LocalStreamReadCount::Data(read)),
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
+                Ok(LocalStreamReadCount::Pending)
+            }
             Err(err) => Err(err),
         }
     }
@@ -142,12 +226,12 @@ pub(crate) fn poll_local_stream_read(
     #[cfg(windows)]
     {
         match windows_named_pipe_available(stream)? {
-            None => Ok(LocalStreamRead::Closed),
-            Some(0) => Ok(LocalStreamRead::Pending),
+            None => Ok(LocalStreamReadCount::Closed),
+            Some(0) => Ok(LocalStreamReadCount::Pending),
             Some(_) => match stream.read(buf) {
-                Ok(0) => Ok(LocalStreamRead::Closed),
-                Ok(_) => Ok(LocalStreamRead::Data),
-                Err(err) if is_connection_closed_error(&err) => Ok(LocalStreamRead::Closed),
+                Ok(0) => Ok(LocalStreamReadCount::Closed),
+                Ok(read) => Ok(LocalStreamReadCount::Data(read)),
+                Err(err) if is_connection_closed_error(&err) => Ok(LocalStreamReadCount::Closed),
                 Err(err) => Err(err),
             },
         }
@@ -347,6 +431,35 @@ mod tests {
         assert!(local_stream_peer_closed(&mut server).unwrap());
 
         let _ = fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_private_named_pipe_accepts_same_user_and_reports_byte_count() {
+        use interprocess::TryClone as _;
+        use std::io::Write as _;
+
+        let path = temp_socket_marker_path("private-pipe");
+        let _ = fs::remove_file(&path);
+        let listener = bind_private_local_listener(&path).unwrap();
+        let mut client = connect_local_stream(&path).unwrap();
+        let mut server = listener.accept().unwrap();
+        client.write_all(b"remote").unwrap();
+
+        let mut buffer = [0_u8; 16];
+        assert!(matches!(
+            poll_local_stream_read_count(&mut server, &mut buffer).unwrap(),
+            LocalStreamReadCount::Data(6)
+        ));
+        assert_eq!(&buffer[..6], b"remote");
+
+        let identity = socket_file_identity(&path).unwrap();
+        drop(client.try_clone().unwrap());
+        drop(client);
+        drop(server);
+        drop(listener);
+        remove_socket_file_if_owned(&path, &identity).unwrap();
+        assert!(!path.exists());
     }
 
     #[cfg(windows)]
